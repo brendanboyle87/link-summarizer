@@ -15,7 +15,7 @@ Migration note: This project now uses Apple Notes inbox input instead of Safari 
 ## Setup
 
 ```bash
-cd /Users/brendanboyle/repos/safari-summarizer
+cd /Users/brendanboyle/repos/link-summarizer
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -112,7 +112,7 @@ Remove:
 
 The installed cron line runs:
 
-- `/Users/brendanboyle/repos/safari-summarizer/scripts/run_once.sh`
+- `/Users/brendanboyle/repos/link-summarizer/scripts/run_once.sh`
 
 `install_cron.sh` sets `TRIAGE_INBOX_NOTE_NAME` in the managed cron block (default: `Reading Inbox`).
 
