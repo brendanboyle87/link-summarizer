@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "title",
+    "url",
+    "word_count",
+    "reading_time_minutes",
+    "summary",
+    "key_takeaways",
+    "suggested_next_step"
+  ],
+  "properties": {
+    "title": {
+      "type": "string"
+    },
+    "url": {
+      "type": "string"
+    },
+    "word_count": {
+      "type": "integer"
+    },
+    "reading_time_minutes": {
+      "type": "integer"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "key_takeaways": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "suggested_next_step": {
+      "type": "string",
+      "enum": [
+        "Read now",
+        "Save for later",
+        "Skip"
+      ]
+    }
+  }
+}
