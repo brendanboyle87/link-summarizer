@@ -2,8 +2,6 @@
 
 Daily macOS automation that reads URLs from an Apple Notes inbox note, summarizes new URLs with LM Studio (OpenAI-compatible API), and appends all new entries into one Apple Notes note titled `Reading Triage — YYYY-MM-DD` in a `Reading Triage` folder.
 
-Migration note: This project now uses Apple Notes inbox input instead of Safari Reading List.
-
 ## Requirements
 
 - macOS with Apple Notes
