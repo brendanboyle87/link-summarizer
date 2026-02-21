@@ -30,15 +30,6 @@ Date: 2026-02-21 09:14
 URL: https://example.com/article
 ```
 
-Optional legacy entries may include a title line, which is supported but not required:
-
-```text
----
-Date: 2026-02-21 09:14
-Title: Some Article
-URL: https://example.com/article
-```
-
 The parser extracts `URL:` lines, ignores malformed lines, tolerates HTML-ish Notes body content, and deduplicates URLs in original order.
 
 ## Inbox Note Override
@@ -100,12 +91,6 @@ Install idempotently:
 
 ```bash
 ./scripts/install_cron.sh
-```
-
-Remove:
-
-```bash
-./scripts/remove_cron.sh
 ```
 
 The installed cron line runs:
