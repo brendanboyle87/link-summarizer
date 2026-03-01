@@ -9,7 +9,6 @@ def test_render_summary_entry_html_format():
         "reading_time_minutes": 4,
         "summary": "A concise summary of the article.",
         "key_takeaways": ["One", "Two", "Three"],
-        "suggested_next_step": "Save for later",
     }
 
     html = render_summary_entry_html(payload)

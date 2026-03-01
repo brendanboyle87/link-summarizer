@@ -3,3 +3,4 @@ trafilatura
 openai
 jsonschema
 pytest
+playwright

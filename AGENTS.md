@@ -4,7 +4,6 @@
 
 - Default input is Apple Notes note `Reading Inbox`.
 - Optional override: `TRIAGE_INBOX_NOTE_NAME`.
-- Do not use Safari `Bookmarks.plist` or Shortcut-export JSON in normal flow.
 - In inbox note content:
   - Parse `URL:` lines.
   - `Title:` is optional and must not be required.

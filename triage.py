@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -30,6 +31,8 @@ DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parent / "schema.json"
 DEFAULT_LOG_PATH = Path.home() / "Library" / "Logs" / "reading-triage.log"
 DEFAULT_ERR_LOG_PATH = Path.home() / "Library" / "Logs" / "reading-triage.err"
 DEFAULT_BASE_URL = "http://localhost:1234/v1"
+DEFAULT_MODEL_ID = "meta/llama-3.3-70b"
+DEFAULT_NOTES_WARMUP_SECONDS = 8
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) "
@@ -39,10 +42,52 @@ USER_AGENT = (
 # Keep prompts well below small local context windows (e.g., 4k).
 MAX_ARTICLE_CHARS = 6_000
 READING_WPM = 220
+BLOCK_PAGE_MAX_WORDS = 260
+BLOCK_PAGE_PHRASES = (
+    "javascript is disabled",
+    "enable javascript",
+    "you need to enable javascript",
+    "please enable javascript to proceed",
+    "a required part of this site couldn't load",
+    "a required part of this site couldn’t load",
+    "checking if the site connection is secure",
+    "verify you are human",
+    "enable js",
+)
 
 
 class SummaryValidationError(Exception):
     """Raised when model output cannot be validated after retry."""
+
+
+def resolve_inbox_note_name(note_name: str | None = None) -> str:
+    return note_name or os.getenv("TRIAGE_INBOX_NOTE_NAME", DEFAULT_INBOX_NOTE_NAME)
+
+
+def warm_up_notes_app(
+    logger: logging.Logger | None = None,
+    warmup_seconds: int | None = None,
+) -> None:
+    if warmup_seconds is None:
+        raw = os.getenv("TRIAGE_NOTES_WARMUP_SECONDS", str(DEFAULT_NOTES_WARMUP_SECONDS)).strip()
+        try:
+            warmup_seconds = int(raw)
+        except ValueError:
+            warmup_seconds = DEFAULT_NOTES_WARMUP_SECONDS
+
+    if warmup_seconds <= 0:
+        return
+
+    if logger:
+        logger.info("Warming up Notes for %ds before inbox read", warmup_seconds)
+
+    subprocess.run(
+        ["open", "-gja", "Notes"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    time.sleep(warmup_seconds)
 
 
 def configure_logging(
@@ -77,7 +122,7 @@ def configure_logging(
 
 
 def read_inbox_note_text(note_name: str | None = None) -> str:
-    resolved_note_name = note_name or os.getenv("TRIAGE_INBOX_NOTE_NAME", DEFAULT_INBOX_NOTE_NAME)
+    resolved_note_name = resolve_inbox_note_name(note_name)
     script = (
         'on run argv\n'
         'set noteName to item 1 of argv\n'
@@ -99,6 +144,40 @@ def read_inbox_note_text(note_name: str | None = None) -> str:
             "Ensure the note exists and Notes automation permissions are granted."
         ) from exc
     return completed.stdout
+
+
+def write_inbox_note_text(note_name: str | None, note_text: str) -> None:
+    resolved_note_name = resolve_inbox_note_name(note_name)
+    script = (
+        'on run argv\n'
+        'set noteName to item 1 of argv\n'
+        'set bodyPath to item 2 of argv\n'
+        'set newBody to (read POSIX file bodyPath as «class utf8»)\n'
+        'tell application "Notes"\n'
+        'set matches to (every note whose name is noteName)\n'
+        'if (count of matches) is 0 then\n'
+        'error "Note not found: " & noteName\n'
+        "end if\n"
+        "set body of (item 1 of matches) to newBody\n"
+        "end tell\n"
+        "end run"
+    )
+    temp_body_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as temp_file:
+            temp_file.write(note_text)
+            temp_body_path = Path(temp_file.name)
+
+        argv = ["osascript", "-e", script, resolved_note_name, str(temp_body_path)]
+        subprocess.run(argv, check=True, capture_output=True, text=True)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"Failed to update Apple Notes inbox note '{resolved_note_name}'. "
+            "Ensure Notes automation permissions are granted."
+        ) from exc
+    finally:
+        if temp_body_path and temp_body_path.exists():
+            temp_body_path.unlink(missing_ok=True)
 
 
 def _normalize_note_text(note_text: str) -> str:
@@ -156,6 +235,104 @@ def parse_inbox_note_urls(note_text: str) -> list[str]:
 def parse_inbox_note_items(note_text: str) -> list[dict[str, str]]:
     urls = parse_inbox_note_urls(note_text)
     return [{"url": url, "title": url} for url in urls]
+
+
+def summarize_error_for_inbox(error_text: str, max_length: int = 140) -> str:
+    text = " ".join(str(error_text).split())
+
+    prefix = "Failed to produce valid summary JSON: "
+    if text.startswith(prefix):
+        text = text[len(prefix) :].strip()
+
+    fallback_match = re.match(
+        r"^Primary path failed \((.*)\); Playwright fallback failed \((.*)\)$",
+        text,
+    )
+    if fallback_match:
+        primary = fallback_match.group(1).strip()
+        fallback = fallback_match.group(2).strip()
+        text = f"Fetch failed: {primary}; fallback failed: {fallback}"
+
+    if len(text) <= max_length:
+        return text
+    return text[: max(0, max_length - 3)].rstrip() + "..."
+
+
+def _split_inbox_note_blocks(note_text: str) -> list[list[str]]:
+    normalized = _normalize_note_text(note_text)
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in lines:
+        if line == "---":
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+
+        if line.startswith("Date:") and current and any(item.startswith("URL:") for item in current):
+            blocks.append(current)
+            current = []
+        current.append(line)
+
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def _extract_url_from_block(block_lines: list[str]) -> str | None:
+    for line in block_lines:
+        match = re.match(r"^\s*URL:\s*(.+?)\s*$", line)
+        if not match:
+            continue
+        extracted = _extract_http_url(match.group(1))
+        if extracted:
+            return extracted
+    return None
+
+
+def apply_triage_results_to_inbox_note(
+    note_text: str,
+    successful_urls: set[str],
+    failed_errors: dict[str, str],
+) -> str:
+    blocks = _split_inbox_note_blocks(note_text)
+    updated_blocks: list[list[str]] = []
+    annotated_failures: set[str] = set()
+
+    for block in blocks:
+        block_url = _extract_url_from_block(block)
+        if block_url and block_url in successful_urls:
+            continue
+
+        next_block = [line for line in block if not line.startswith("Error:")]
+        if block_url and block_url in failed_errors:
+            next_block.append(f"Error: {summarize_error_for_inbox(failed_errors[block_url])}")
+            annotated_failures.add(block_url)
+        updated_blocks.append(next_block)
+
+    for url, error_text in failed_errors.items():
+        if url in annotated_failures:
+            continue
+        updated_blocks.append(
+            [
+                f"URL: [{url}]",
+                f"Error: {summarize_error_for_inbox(error_text)}",
+            ]
+        )
+
+    if not updated_blocks:
+        return ""
+
+    lines: list[str] = []
+    for block in updated_blocks:
+        if not block:
+            continue
+        lines.append("---")
+        lines.extend(block)
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def init_db(db_path: Path | str) -> None:
@@ -287,9 +464,23 @@ def validate_summary_payload(payload: dict[str, Any], schema: dict[str, Any]) ->
         raise SummaryValidationError("key_takeaways must contain between 3 and 7 items")
 
     summary_text = str(payload.get("summary", "")).strip()
-    sentence_count = len([s for s in re.split(r"[.!?]+", summary_text) if s.strip()])
+    sentence_count = count_sentences(summary_text)
     if sentence_count < 2 or sentence_count > 4:
         raise SummaryValidationError("summary must contain 2-4 sentences")
+
+
+def count_sentences(text: str) -> int:
+    normalized = " ".join(text.strip().split())
+    if not normalized:
+        return 0
+
+    matches = re.findall(
+        r".+?(?<!\d)[.!?](?!\d)[\"')\]]*(?=\s|$)",
+        normalized,
+    )
+    if matches:
+        return len(matches)
+    return 1
 
 
 def compute_word_metrics(text: str) -> tuple[int, int]:
@@ -327,11 +518,6 @@ def normalize_summary_payload(payload: dict[str, Any]) -> dict[str, Any]:
         takeaways.append("Review the full article for additional detail.")
     normalized["key_takeaways"] = takeaways
 
-    next_step = str(normalized.get("suggested_next_step", "")).strip()
-    allowed = {"Read now", "Save for later", "Skip"}
-    if next_step not in allowed:
-        normalized["suggested_next_step"] = "Save for later"
-
     title = str(normalized.get("title", "")).strip()
     if not title:
         normalized["title"] = "Untitled article"
@@ -346,9 +532,8 @@ def build_messages(article_title: str, article_url: str, article_text: str, stri
     )
     user_prompt = (
         "Summarize the article and return strict JSON with keys: "
-        "title, url, word_count, reading_time_minutes, summary, key_takeaways, suggested_next_step. "
-        "Constraints: summary must be 2-4 sentences, key_takeaways must have 3-7 concise items, "
-        "suggested_next_step must be exactly one of: Read now, Save for later, Skip. "
+        "title, url, word_count, reading_time_minutes, summary, key_takeaways. "
+        "Constraints: summary must be 2-4 sentences, key_takeaways must have 3-7 concise items. "
         f"Title: {article_title}\n"
         f"URL: {article_url}\n"
         "Article:\n"
@@ -409,6 +594,33 @@ def fetch_page_html(url: str, timeout: int = 30) -> str:
     return response.text
 
 
+def fetch_page_html_with_playwright(url: str, timeout: int = 30) -> str:
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "Playwright fallback unavailable. Install playwright and run 'playwright install chromium'."
+        ) from exc
+
+    timeout_ms = max(timeout * 1000, 5_000)
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                ignore_https_errors=True,
+            )
+            page = context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 15_000))
+            except Exception:  # noqa: BLE001
+                pass
+            return page.content()
+        finally:
+            browser.close()
+
+
 def extract_article_text(html_content: str, url: str) -> str:
     text = trafilatura.extract(
         html_content,
@@ -421,10 +633,44 @@ def extract_article_text(html_content: str, url: str) -> str:
     return text.strip()
 
 
-def select_model_id(base_url: str, explicit_model: str | None = None) -> str:
-    if explicit_model:
-        return explicit_model
+def fetch_and_extract_article_text(
+    url: str,
+    timeout: int = 30,
+    logger: logging.Logger | None = None,
+) -> str:
+    primary_error: Exception | None = None
 
+    try:
+        html_content = fetch_page_html(url, timeout=timeout)
+        extracted = extract_article_text(html_content, url)
+        if is_probable_block_page_text(extracted):
+            raise ValueError("Extraction returned a JavaScript/anti-bot placeholder page")
+        return extracted
+    except Exception as exc:  # noqa: BLE001
+        primary_error = exc
+        if logger:
+            logger.info("Primary fetch/extract failed for %s; trying Playwright fallback", url)
+
+    try:
+        rendered_html = fetch_page_html_with_playwright(url, timeout=timeout)
+        return extract_article_text(rendered_html, url)
+    except Exception as fallback_exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"Primary path failed ({primary_error}); Playwright fallback failed ({fallback_exc})"
+        ) from fallback_exc
+
+
+def is_probable_block_page_text(text: str) -> bool:
+    normalized = " ".join(text.lower().split())
+    if not normalized:
+        return False
+    words = len(normalized.split())
+    if words > BLOCK_PAGE_MAX_WORDS:
+        return False
+    return any(phrase in normalized for phrase in BLOCK_PAGE_PHRASES)
+
+
+def list_available_models(base_url: str) -> list[str]:
     response = requests.get(
         f"{base_url.rstrip('/')}/models",
         timeout=10,
@@ -433,12 +679,98 @@ def select_model_id(base_url: str, explicit_model: str | None = None) -> str:
     response.raise_for_status()
     payload = response.json()
     data = payload.get("data", [])
-    if not data:
-        raise ValueError("No models returned by LM Studio /v1/models")
-    first = data[0]
-    model_id = first.get("id") if isinstance(first, dict) else None
+    if not isinstance(data, list):
+        raise ValueError("LM Studio /v1/models returned unexpected payload")
+    models: list[str] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        if model_id:
+            models.append(str(model_id))
+    return models
+
+
+def _resolve_lms_cli_path() -> str:
+    env_path = os.getenv("LMS_CLI_PATH")
+    if env_path:
+        resolved = str(Path(env_path).expanduser())
+        if Path(resolved).exists():
+            return resolved
+        raise FileNotFoundError(f"LMS_CLI_PATH points to a missing file: {resolved}")
+
+    detected = shutil.which("lms")
+    if detected:
+        return detected
+
+    fallback = Path.home() / ".lmstudio" / "bin" / "lms"
+    if fallback.exists():
+        return str(fallback)
+
+    raise FileNotFoundError(
+        "LM Studio CLI not found. Install LM Studio CLI or set LMS_CLI_PATH."
+    )
+
+
+def ensure_lmstudio_server_running(
+    base_url: str,
+    logger: logging.Logger | None = None,
+    startup_wait_seconds: int = 20,
+) -> None:
+    try:
+        list_available_models(base_url)
+        return
+    except (requests.ConnectionError, requests.Timeout) as exc:
+        initial_error = exc
+
+    if logger:
+        logger.info("LM Studio server unreachable at %s; attempting to start via lms CLI", base_url)
+
+    lms_path = _resolve_lms_cli_path()
+    cmd = [lms_path, "server", "start"]
+    port = urlparse(base_url).port
+    if port:
+        cmd.extend(["--port", str(port)])
+
+    completed = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if completed.returncode != 0:
+        output = " | ".join(
+            part.strip() for part in (completed.stdout, completed.stderr) if part and part.strip()
+        )
+        detail = output or f"exit code {completed.returncode}"
+        raise RuntimeError(f"Failed to start LM Studio server: {detail}") from initial_error
+
+    deadline = time.time() + max(1, startup_wait_seconds)
+    last_error: Exception | None = None
+    while time.time() < deadline:
+        try:
+            list_available_models(base_url)
+            if logger:
+                logger.info("LM Studio server is reachable at %s", base_url)
+            return
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_error = exc
+            time.sleep(1)
+
+    raise RuntimeError(
+        f"LM Studio server did not become reachable at {base_url} after startup attempt: {last_error}"
+    ) from initial_error
+
+
+def select_model_id(base_url: str, explicit_model: str | None = None) -> str:
+    model_id = (explicit_model or "").strip()
     if not model_id:
-        raise ValueError("LM Studio model list did not include an id")
+        raise ValueError(
+            "No model configured. Set --model or TRIAGE_LMSTUDIO_MODEL."
+        )
+
+    available_models = list_available_models(base_url)
+    if model_id not in available_models:
+        available = ", ".join(available_models) if available_models else "(none)"
+        raise ValueError(
+            f"Requested model '{model_id}' is not reachable via {base_url.rstrip('/')}/models. "
+            f"Available models: {available}"
+        )
     return model_id
 
 
@@ -556,6 +888,7 @@ def run_triage(
     init_db(db_path)
     schema = load_schema(schema_path)
 
+    warm_up_notes_app(logger=logger)
     note_text = read_inbox_note_text(inbox_note_name)
     items = parse_inbox_note_items(note_text)
     now_ts = current_timestamp()
@@ -567,9 +900,11 @@ def run_triage(
         logger.info("No pending Reading Inbox items to summarize")
         return 0
 
+    selected_model = (model or os.getenv("TRIAGE_LMSTUDIO_MODEL") or DEFAULT_MODEL_ID).strip()
+    ensure_lmstudio_server_running(base_url=base_url, logger=logger)
     selected_model = select_model_id(
         base_url=base_url,
-        explicit_model=model or os.getenv("TRIAGE_LMSTUDIO_MODEL"),
+        explicit_model=selected_model,
     )
     logger.info("Using model: %s", selected_model)
 
@@ -579,14 +914,14 @@ def run_triage(
     )
 
     successful_entries: list[tuple[str, str]] = []
+    failed_errors: dict[str, str] = {}
 
     for row in pending:
         url = row["url"]
         title = row["title"]
 
         try:
-            html_content = fetch_page_html(url)
-            article_text = extract_article_text(html_content, url)
+            article_text = fetch_and_extract_article_text(url, logger=logger)
             summary = summarize_article_with_retry(
                 client=client,
                 model=selected_model,
@@ -603,34 +938,51 @@ def run_triage(
         except Exception as exc:  # noqa: BLE001
             error_text = str(exc)
             mark_failed(db_path, url, error_text)
+            failed_errors[url] = error_text
             logger.error("Failed to summarize %s: %s", url, error_text)
 
         time.sleep(1)
 
-    if not successful_entries:
+    if not successful_entries and not failed_errors:
         logger.info("No successful summaries produced")
         return 0
 
-    today = date.today().isoformat()
-    note_title = f"Reading Triage — {today}"
-    combined_html = "\n".join(chunk for _, chunk in successful_entries)
+    if successful_entries:
+        today = date.today().isoformat()
+        note_title = f"Reading Triage — {today}"
+        combined_html = "\n".join(chunk for _, chunk in successful_entries)
 
-    if dry_run:
-        logger.info("Dry run enabled: skipping Apple Notes write")
-    else:
-        try:
-            upsert_daily_note("Reading Triage", note_title, combined_html)
-            logger.info("Updated Apple Note: %s", note_title)
-        except Exception as exc:  # noqa: BLE001
-            error_text = f"Apple Notes write failed: {exc}"
-            for url, _ in successful_entries:
-                mark_failed(db_path, url, error_text)
-            logger.error(error_text)
-            return 1
+        if dry_run:
+            logger.info("Dry run enabled: skipping Apple Notes write")
+        else:
+            try:
+                upsert_daily_note("Reading Triage", note_title, combined_html)
+                logger.info("Updated Apple Note: %s", note_title)
+            except Exception as exc:  # noqa: BLE001
+                error_text = f"Apple Notes write failed: {exc}"
+                for url, _ in successful_entries:
+                    mark_failed(db_path, url, error_text)
+                logger.error(error_text)
+                return 1
 
     summarized_at = current_timestamp()
     for url, _ in successful_entries:
         mark_summarized(db_path, url, summarized_at)
+
+    if dry_run:
+        logger.info("Dry run enabled: skipping Reading Inbox write")
+    else:
+        try:
+            updated_inbox = apply_triage_results_to_inbox_note(
+                note_text=note_text,
+                successful_urls={url for url, _ in successful_entries},
+                failed_errors=failed_errors,
+            )
+            write_inbox_note_text(inbox_note_name, updated_inbox)
+            logger.info("Updated Apple Note: %s", resolve_inbox_note_name(inbox_note_name))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Reading Inbox update failed: %s", exc)
+            return 1
 
     logger.info("Summarized %d URLs", len(successful_entries))
     return len(successful_entries)
@@ -666,7 +1018,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         default=None,
-        help="Model id override (otherwise TRIAGE_LMSTUDIO_MODEL or /v1/models first item)",
+        help=(
+            "Model id override "
+            f"(default: TRIAGE_LMSTUDIO_MODEL or '{DEFAULT_MODEL_ID}'; "
+            "must be present in /v1/models)"
+        ),
     )
     parser.add_argument(
         "--dry-run",

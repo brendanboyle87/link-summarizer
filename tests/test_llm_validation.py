@@ -56,7 +56,6 @@ def _schema():
             "reading_time_minutes",
             "summary",
             "key_takeaways",
-            "suggested_next_step",
         ],
         "properties": {
             "title": {"type": "string"},
@@ -67,10 +66,6 @@ def _schema():
             "key_takeaways": {
                 "type": "array",
                 "items": {"type": "string"},
-            },
-            "suggested_next_step": {
-                "type": "string",
-                "enum": ["Read now", "Save for later", "Skip"],
             },
         },
         "additionalProperties": False,
@@ -94,7 +89,6 @@ def test_summarize_retries_once_after_invalid_json_then_succeeds():
                         "reading_time_minutes": 1,
                         "summary": "Sentence one. Sentence two.",
                         "key_takeaways": ["K1", "K2", "K3"],
-                        "suggested_next_step": "Read now",
                     }
                 ),
             ]
@@ -153,7 +147,6 @@ def test_summarize_normalizes_borderline_payload_values():
                     "reading_time_minutes": 1,
                     "summary": "Single sentence only",
                     "key_takeaways": ["K1"],
-                    "suggested_next_step": "Later",
                 }
             )
         ]
@@ -171,7 +164,6 @@ def test_summarize_normalizes_borderline_payload_values():
     sentence_count = len([s for s in result["summary"].split(".") if s.strip()])
     assert 2 <= sentence_count <= 4
     assert 3 <= len(result["key_takeaways"]) <= 7
-    assert result["suggested_next_step"] in {"Read now", "Save for later", "Skip"}
 
 
 def test_summarize_keeps_summary_within_four_sentences():
@@ -185,7 +177,6 @@ def test_summarize_keeps_summary_within_four_sentences():
                     "reading_time_minutes": 1,
                     "summary": "One. Two. Three. Four.",
                     "key_takeaways": ["K1", "K2", "K3"],
-                    "suggested_next_step": "Read now",
                 }
             )
         ]
@@ -202,3 +193,21 @@ def test_summarize_keeps_summary_within_four_sentences():
 
     sentence_count = len([s for s in result["summary"].split(".") if s.strip()])
     assert sentence_count == 4
+
+
+def test_validate_summary_payload_allows_decimals_without_overcounting_sentences():
+    payload = {
+        "title": "A",
+        "url": "https://example.com/a",
+        "word_count": 100,
+        "reading_time_minutes": 1,
+        "summary": (
+            "Harness changes improved Terminal Bench 2.0 performance. "
+            "The score rose from 52.8 to 66.5 in controlled tests. "
+            "Teams used tracing to isolate regressions before changes. "
+            "The update improved reliability while preserving quality."
+        ),
+        "key_takeaways": ["K1", "K2", "K3"],
+    }
+
+    validate_summary_payload(payload, _schema())

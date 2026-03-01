@@ -8,8 +8,7 @@
     "word_count",
     "reading_time_minutes",
     "summary",
-    "key_takeaways",
-    "suggested_next_step"
+    "key_takeaways"
   ],
   "properties": {
     "title": {
@@ -32,14 +31,6 @@
       "items": {
         "type": "string"
       }
-    },
-    "suggested_next_step": {
-      "type": "string",
-      "enum": [
-        "Read now",
-        "Save for later",
-        "Skip"
-      ]
     }
   }
 }
